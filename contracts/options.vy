@@ -18,7 +18,8 @@ struct Option:
     duration: uint256
     buySellType: String[4]
     optionType: String[8]
-    price: uint256
+    strikePrice: uint256
+    marketPrice: uint256
     startTime: uint256
     purchased: bool
 
@@ -55,6 +56,9 @@ sellerLedger: HashMap[String[4], HashMap[uint256, uint256]]
 # Ticker -> id -> amount
 buyerLedger: HashMap[String[4], HashMap[uint256, uint256]]
 
+# hold info of wether they are a riskTaker or buyer
+creatorType: HashMap[uint256, String[5]]
+
 @external
 def __init__(_crv_price: uint256, _uni_price: uint256, _comp_price: uint256):
     self.tokenToPrice["CRV"] = _crv_price
@@ -64,6 +68,9 @@ def __init__(_crv_price: uint256, _uni_price: uint256, _comp_price: uint256):
     self.durationMultiplier[1_296_000] = 0.1
     self.durationMultiplier[2_592_000] = 0.3
     self.durationMultiplier[5_184_000] = 0.5
+
+    self.creatorType[0] = "buyer"
+    self.creatorType[1] = "taker"
 
 #Need a function that will return current price of token for option, Will return the difference owed on each Token
 # Example if TokenA = 15 and the risk would be 18 per TokenA, then this function will return 3 (The difference b/t rick price and actual price)
@@ -94,7 +101,7 @@ def strikePrice(currentAssetPrice: uint256, _duration: uint256, _buySellType: St
 # It'll just be one for each, I'll have different checks depending on the scenario
 @external
 @payable
-def createOptionSeller(_ticker: String[4], _duration: uint256, _buySellType: String[4], _optionType: String[8]):
+def createOption(ownerType: uint256, _ticker: String[4], _duration: uint256, _buySellType: String[4], _optionType: String[8]):
     assert self.tokenToPrice[_ticker] > 0, "This token is not supported"
     assert _duration == 1_296_000 or _duration == 2_592_000 or _duration == 5_184_000, "That is not an accepted starting time"
     
@@ -105,76 +112,115 @@ def createOptionSeller(_ticker: String[4], _duration: uint256, _buySellType: Str
     # The seller will be paying the amount of current_market_price * 100, they will receive the current_strike_price * 10,
     # when someone buys this option. If buyer doesn't exercise their buy option of buying this particular Token for
     # current_market_price a piece, Seller will receive all of their Tokens back
-    assert msg.value >= (current_market_price * 100), "You aren't sending enough to create option"
+
+    account_risk_taker: address = ZERO_ADDRESS
+    account_buyer: address = ZERO_ADDRESS
+
+    if self.creatorType[ownerType] == "buyer":
+        assert msg.value >= (current_strike_price * 100), "You're not sending enough to cover strike price time 100"
+        account_buyer = msg.sender
+    elif self.creatorType[ownerType] == "taker":
+        assert msg.value >= (current_market_price * 100), "You aren't sending enough to cover current market price times 100"
+        account_risk_taker = msg.sender
+
     if _ticker == "CRV":
         self.curveOptions[self.curveCounter] = Option({
             optionId: self.curveCounter,
-            owner: ZERO_ADDRESS,
-            riskTaker: msg.sender,
+            owner: account_buyer,
+            riskTaker: account_risk_taker,
             underlyingTokenTicker: _ticker,
             duration: _duration,
             buySellType: _buySellType,
             optionType: _optionType,
-            price: current_strike_price,
+            strikePrice: current_strike_price,
+            marketPrice: current_market_price,
             startTime: block.timestamp,
             purchased: False
         })
         self.sellerLedger[_ticker][self.curveCounter] = (current_market_price * 100)
+        self.buyerLedger[_ticker][self.curveCounter] = (current_strike_price * 100)
         self.curveCounter += 1
     elif _ticker == "UNI":
         self.uniOptions[self.uniCounter] = Option({
             optionId: self.uniCounter,
-            owner: ZERO_ADDRESS,
-            riskTaker: msg.sender,
+            owner: account_buyer,
+            riskTaker: account_risk_taker,
             underlyingTokenTicker: _ticker,
             duration: _duration,
             buySellType: _buySellType,
             optionType: _optionType,
-            price: current_strike_price,
+            strikePrice: current_strike_price,
+            marketPrice: current_market_price,
             startTime: block.timestamp,
             purchased: False
         })
         self.sellerLedger[_ticker][self.uniCounter] = (current_market_price * 100)
+        self.buyerLedger[_ticker][self.uniCounter] = (current_strike_price * 100)
         self.uniCounter += 1
     else:
         self.compoundOptions[self.compoundCounter] = Option({
             optionId: self.compoundCounter,
-            owner: ZERO_ADDRESS,
-            riskTaker: msg.sender,
+            owner: account_buyer,
+            riskTaker: account_risk_taker,
             underlyingTokenTicker: _ticker,
             duration: _duration,
             buySellType: _buySellType,
             optionType: _optionType,
-            price: current_strike_price,
+            strikePrice: current_strike_price,
+            marketPrice: current_market_price,
             startTime: block.timestamp,
             purchased: False
         })
         self.sellerLedger[_ticker][self.compoundCounter] = (current_market_price * 100)
+        self.buyerLedger[_ticker][self.compoundCounter] = (current_strike_price * 100)
         self.compoundCounter += 1
 
 @external
 @payable
-def buyOptionBuyer(_optionId: uint256, _ticker: String[4]):
+def buyOption(_optionId: uint256, _ticker: String[4]):
     if _ticker == "CRV":
         current_option: Option = self.curveOptions[_optionId]
         assert current_option.purchased == False, "This Curve option has already been purchased"
-        # This "price" refers to the strike price * 100, what the buyer must pay to obtain an option
-        assert msg.value >= (current_option.price * 100), "You don't have enough to purchase this Curve option"
-        # Send the risk taker his strike payment, that he receives regardless if buyer executes his option
-        send(current_option.riskTaker, (current_option.price * 100))
-        self.curveOptions[_optionId].owner = msg.sender
+        # This if statment will check whether a buyer or riskTaker is making the purchase
+        # If a buyer is purchasing the option, we will make sure they are supplying 100 times
+        # the strike price when the Option was made. Then we will deposit that amount towards the 
+        # riskTaker immediately.
+        if current_option.owner == ZERO_ADDRESS and current_option.riskTaker != ZERO_ADDRESS:
+            assert msg.value >= (current_option.strikePrice * 100), "You don't have enough to purchase this Curve option"
+            # Send the risk taker his strike payment, that he receives regardless if buyer executes his option
+            send(current_option.riskTaker, (current_option.strikePrice * 100))
+            self.curveOptions[_optionId].owner = msg.sender
+            self.curveOptions[_optionId].purchased = True
+        elif current_option.riskTaker == ZERO_ADDRESS and current_option.owner != ZERO_ADDRESS:
+            assert msg.value >= (current_option.marketPrice * 100), "You don't have enough to purchase this Curve option"
+            self.curveOptions[_optionId].riskTaker = msg.sender
+            self.curveOptions[_optionId].purchased = True
     elif _ticker == "UNI":
         current_option: Option = self.uniOptions[_optionId]
         assert current_option.purchased == False, "This Uniswap option has already been purchased"
-        assert msg.value >= (current_option.price * 100), "You don't have enough to purchase this Uniswap option"
-        send(current_option.riskTaker, (current_option.price * 100))
-        self.uniOptions[_optionId].owner = msg.sender
+
+        if current_option.owner == ZERO_ADDRESS and current_option.riskTaker != ZERO_ADDRESS:
+            assert msg.value >= (current_option.strikePrice * 100), "You don't have enough to purchase this Uniswap option"
+            send(current_option.riskTaker, (current_option.strikePrice * 100))
+            self.uniOptions[_optionId].owner = msg.sender
+            self.uniOptions[_optionId].purchased = True
+        elif current_option.riskTaker == ZERO_ADDRESS and current_option.owner != ZERO_ADDRESS:
+            assert msg.value >= (current_option.marketPrice * 100), "You don't have enough to purchase this Uniswap option"
+            self.uniOptions[_optionId].riskTaker = msg.sender
+            self.uniOptions[_optionId].purchased = True
     else:
         current_option: Option = self.compoundOptions[_optionId]
         assert current_option.purchased == False, "This Compound option has already been purchased"
-        assert msg.value >= (current_option.price * 100), "You don't have enough to purchase this Compound option"
-        send(current_option.riskTaker, (current_option.price * 100))
-        self.compoundOptions[_optionId].owner = msg.sender
+
+        if current_option.owner == ZERO_ADDRESS and current_option.riskTaker != ZERO_ADDRESS:
+            assert msg.value >= (current_option.strikePrice * 100), "You don't have enough to purchase this Compound option"
+            send(current_option.riskTaker, (current_option.strikePrice * 100))
+            self.compoundOptions[_optionId].owner = msg.sender
+            self.compoundOptions[_optionId].purchased = True
+        elif current_option.riskTaker == ZERO_ADDRESS and current_option.owner != ZERO_ADDRESS:
+            assert msg.value >= (current_option.marketPrice * 100), "You don't have enough to purchase this Compound option"
+            self.compoundOptions[_optionId].riskTaker = msg.sender
+            self.compoundOptions[_optionId].purchased = True
 
 # @external
 # @payable
