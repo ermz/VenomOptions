@@ -59,6 +59,10 @@ buyerLedger: HashMap[String[4], HashMap[uint256, uint256]]
 # hold info of wether they are a riskTaker or buyer
 creatorType: HashMap[uint256, String[5]]
 
+# Purchased options that are up for sale
+# Ticker -> option Id -> price
+optionForSale: HashMap[String[4], HashMap[uint256, uint256]]
+
 @external
 def __init__(_crv_price: uint256, _uni_price: uint256, _comp_price: uint256):
     self.tokenToPrice["CRV"] = _crv_price
@@ -222,32 +226,110 @@ def buyOption(_optionId: uint256, _ticker: String[4]):
             self.compoundOptions[_optionId].riskTaker = msg.sender
             self.compoundOptions[_optionId].purchased = True
 
-# @external
-# @payable
-# def createOptionBuyer(_ticker: String[4], _duration: uint256, _buySellType: String[4], _optionType: String[8]):
-#     assert self.tokenToPrice[_ticker] > 0, "This token is not supported"
-#     assert _duration == 1_296_000 or _duration == 2_592_000 or _duration == 5_184_000, "That is not an accepted starting time"
-
 
 # sellPurchasedOption
 # A function that allows Options that have been purchase once already to be purchased by other users if they want
 # Only avaialble once Option.purchased attribute is true
+@external
+def sellPurchasedOption(_optionId: uint256, _ticker: String[4], _price: uint256):
+    assert self.optionForSale[_ticker][_optionId] == 0, "This Option is already up for sale"
+    if _ticker == "CRV":
+        assert self.curveOptions[_optionId].owner == msg.sender, "You are not the owner of this Curve option"
+        assert self.curveOptions[_optionId].purchased == True, "This option hasn't been purchased yet"
+        self.optionForSale[_ticker][_optionId] = _price
+    elif _ticker == "UNI":
+        assert self.uniOptions[_optionId].owner == msg.sender, "You are not the owner of this Uniswap option"
+        assert self.uniOptions[_optionId].purchased == True, "This option hasn't been puchased yet"
+        self.optionForSale[_ticker][_optionId] = _price
+    else:
+        assert self.compoundOptions[_optionId].owner == msg.sender, "You are not the owner of this Compound option"
+        assert self.compoundOptions[_optionId].purchased == True, "This option hasn't been purchased yet"
+        self.optionForSale[_ticker][_optionId] = _price
 
-# buyPurchaseOption
+# buyPurchasedOption
 # Also the opposite of this function of buying already bought options
 # secondary market function 
+@external
+@payable
+def buyPurchasedOption(_optionId: uint256, _ticker: String[4]):
+    assert self.optionForSale[_ticker][_optionId] != 0, "Not for sale"
+    assert msg.value >= self.optionForSale[_ticker][_optionId], "Insufficient funds for purchase"
+    if _ticker == "CRV":
+        self.curveOptions[_optionId].owner = msg.sender
+    elif _ticker == "UNI":
+        self.curveOptions[_optionId].owner = msg.sender
+    else:
+        self.compoundOptions[_optionId].owner = msg.sender
+
 
 # cashOut
-# After an Option time has ended and buyer has decided not to use option
+# After an Option time has ended and buyer has decided not to use option(1 day time)
 # Seller can claim their money on hold back
 # They would already have the strike payment
+@external
+def cashOut(_ticker: String[4], _optionId: uint256):
+    assert self.sellerLedger[_ticker][_optionId] != 0, "There is nothing to collect"
+    current_option: Option = empty(Option)
+    if _ticker == "CRV":
+        current_option = self.curveOptions[_optionId]
+    elif _ticker == "UNI":
+        current_option = self.uniOptions[_optionId]
+    else:
+        current_option = self.compoundOptions[_optionId]
+
+    assert current_option.riskTaker == msg.sender, "You are not the riskTaker of this option"
+    assert (current_option.startTime + current_option.duration + 86400) <= block.timestamp, "Buyer still has time to call option"
+    send(msg.sender, self.sellerLedger[_ticker][_optionId])
+    self.sellerLedger[_ticker][_optionId] = 0
 
 # callOption
 # buyer decides to exercise their option and purchase/sell tokens at price agreed on from riskTaker
 # buyer will receive funds that are on hold from riskTaker
 # buyer will also transfer corresponding tokens to riskTaker
+@external
+def callOption(_ticker: String[4], _optionId: uint256):
+    assert self.sellerLedger[_ticker][_optionId] != 0, "Too late to call option"
+    current_option: Option = empty(Option)
+    if _ticker == "CRV":
+        current_option = self.curveOptions[_optionId]
+    elif _ticker == "UNI":
+        current_option = self.uniOptions[_optionId]
+    else:
+        current_option = self.compoundOptions[_optionId]
+    
+    assert current_option.owner == msg.sender, "You are not the buyer of this option"
+    assert current_option.purchased == True, "This option hasn't been purchased"
+    assert (current_option.startTime + current_option.duration + 86400) > block.timestamp, "It's too late to call this option"
+
+    # If European model check that it can only be called once time has ended,
+    # American option can be called anytime before elapsed time in general
+    if current_option.optionType == "European":
+        assert (current_option.startTime + current_option.duration) < block.timestamp, "It's too early to call this European option"
+
+    send(msg.sender, self.sellerLedger[_ticker][_optionId])
+    self.sellerLedger[_ticker][_optionId] = 0
+
+    # Need to make up or find an actual interface I can make
+    # Where the buyer sends 100 tokens that are specific to the ticker
+    # mentioned above
+    
+    
 
 # RebalanceOption
 # Make your option go through marketPrice again to be more favorable
 # Pay more or receive some back depending on current market
 # Maybe give Option attribute regarding purchaseable time
+# Maybe if option has been rebalanced then there's no need for change is amount paid
+# by buyer or riskTaker, It will be sorted out by amount of tokens given
+
+# @external
+# @payable
+# def rebalanceOption(_ticker:String[4], _optionId:uint256):
+#     assert self.sellerLedger[_ticker][_optionId] != 0, "This option does not exist"
+    
+#     if _ticker == "CRV":
+#         current_option: Option = self.curveOptions[_optionId]
+#         assert current_option.purchased == False, "This option has been purchased already"
+#         if current_option.owner == ZERO_ADDRESS:
+#             balance_on_hold: uint256 = self.sellerLedger[_ticker][_optionId]
+            
