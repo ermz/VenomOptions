@@ -24,7 +24,7 @@ struct Option:
     purchased: bool
 
 # Each option is worth 10 tokens. Regardless of type of option (sell/buy)
-SHARES_PER_OPTION: constant(uint256) = 10
+SHARES_PER_OPTION: constant(uint256) = 100
 
 #Curve
 curveOptions: HashMap[uint256, Option]
@@ -89,13 +89,13 @@ def strikePrice(currentAssetPrice: uint256, _duration: uint256, _buySellType: St
     # volatility_multiplier: uint256 = 0
     
     # Will return the addon for the current asset price based on duration of option
-    duration_multiplier = convert(self.durationMultiplier[_duration], uint256) * currentAssetPrice
+    duration_multiplier = convert(self.durationMultiplier[_duration], uint256) *currentAssetPrice
     
     # Wille return addon for option type based on whether it's an "American" or "European" option
     if _optionType == "American":
         option_type_multiplier = convert(0.1, uint256) * currentAssetPrice
     else:
-        option_type_multiplier = convert(0.4, uint256) * currentAssetPrice
+        option_type_multiplier = convert(0.4, uint256) *currentAssetPrice
 
     total_multiplier: uint256 = duration_multiplier + option_type_multiplier
 
@@ -315,21 +315,162 @@ def callOption(_ticker: String[4], _optionId: uint256):
     
     
 
-# RebalanceOption
-# Make your option go through marketPrice again to be more favorable
-# Pay more or receive some back depending on current market
-# Maybe give Option attribute regarding purchaseable time
-# Maybe if option has been rebalanced then there's no need for change is amount paid
-# by buyer or riskTaker, It will be sorted out by amount of tokens given
-
-# @external
-# @payable
-# def rebalanceOption(_ticker:String[4], _optionId:uint256):
-#     assert self.sellerLedger[_ticker][_optionId] != 0, "This option does not exist"
+@internal
+def rebalanceStrikePrice(currentAssetPrice: uint256, start_time: uint256, duration: uint256, _optionType: String[8]) -> uint256:
+    # original_duration_multiplier: uint256 = self.duration_multiplier[duration]
     
-#     if _ticker == "CRV":
-#         current_option: Option = self.curveOptions[_optionId]
-#         assert current_option.purchased == False, "This option has been purchased already"
-#         if current_option.owner == ZERO_ADDRESS:
-#             balance_on_hold: uint256 = self.sellerLedger[_ticker][_optionId]
+    time_left: uint256 = (start_time + duration) - block.timestamp
+    time_difference: uint256 = 0
+    new_time_percentage: uint256 = 0
+    new_time_multiplier: uint256 = 0
+
+    assert time_left > 0, "There's no time left for rebalancing, buy time has ended"
+
+    if time_left > 2_592_000:
+        time_difference = time_left - 2_592_000
+        new_time_percentage = ((time_difference / 2_592_000) * 20) / 100 + convert(0.3, uint256)
+        new_time_multiplier = new_time_percentage * currentAssetPrice
+    elif time_left > 1_296_000:
+        time_difference = time_left - 1_296_000
+        new_time_percentage = ((time_difference / 1_296_000) * 20) / 100 + convert(0.1, uint256)
+        new_time_multiplier = new_time_percentage * currentAssetPrice
+    else:
+        new_time_percentage = ((time_left / 1_296_000) * 10) / 100
+        new_time_multiplier = new_time_percentage * currentAssetPrice
+
+    option_type_multiplier: uint256 = 0
+
+    if _optionType == "American":
+        option_type_multiplier = convert(0.1, uint256) * currentAssetPrice
+    else:
+        option_type_multiplier = convert(0.4, uint256) * currentAssetPrice
+
+    total_multiplier: uint256 = new_time_multiplier + option_type_multiplier
+
+    return total_multiplier
+    
+
+@external
+@payable
+def rebalanceOption(_ticker:String[4], _optionId:uint256):
+    assert self.sellerLedger[_ticker][_optionId] != 0, "This option does not exist"
+    
+    if _ticker == "CRV":
+        current_option: Option = self.curveOptions[_optionId]
+        current_token_price: uint256 = self.tokenToPrice[_ticker]
+        new_strike_price: uint256 = self.rebalanceStrikePrice(current_token_price,
+                                                              current_option.startTime,
+                                                              current_option.duration,
+                                                              current_option.optionType
+                                                              )
+        assert current_option.purchased == False, "This option has been purchased already"
+        if current_option.owner == ZERO_ADDRESS:
+            assert current_option.riskTaker == msg.sender, "You are not the riskTaker of this option"
+            # balance_on_hold is for sellerLedger in this instance
+            balance_on_hold: uint256 = self.sellerLedger[_ticker][_optionId]
+
+            if current_token_price > current_option.marketPrice:
+                # Then assert that seller is sending enough funds for change
+                # Also change the strike price for when a buyer tries to purchase this option
+                assert msg.value >= ((current_token_price * 100) - balance_on_hold), "You aren't sending enough to cover for the price increase of token"
+                
+            elif current_token_price < current_option.marketPrice:
+                # Find the difference between balance on hold and how much the price has gone down,
+                # Return the difference to the ristTaker
+                send(msg.sender, (balance_on_hold - (current_token_price * 100)))
+
+            self.sellerLedger[_ticker][_optionId] = current_token_price * 100
+            self.curveOptions[_optionId].strikePrice = new_strike_price
+            self.curveOptions[_optionId].marketPrice = current_token_price
+        
+        elif current_option.riskTaker == ZERO_ADDRESS:
+            assert current_option.owner == msg.sender, "You are not the owner of this option"
+            # balance_on_holde is specific to buyer ledger
+            balance_on_hold: uint256 = self.buyerLedger[_ticker][_optionId]
+
+            if new_strike_price > current_option.strikePrice:
+                assert msg.value >= ((new_strike_price * 100) - balance_on_hold), "You aren't sending enough to cover for the price increase of token"
+            elif new_strike_price < current_option.strikePrice:
+                send(msg.sender, (balance_on_hold - (new_strike_price * 100)))
+
+            self.buyerLedger[_ticker][_optionId] = new_strike_price * 100
+            self.curveOptions[_optionId].strikePrice = new_strike_price
+            self.curveOptions[_optionId].marketPrice = current_token_price
+
+    elif _ticker == "UNI":
+        current_option: Option = self.uniOptions[_optionId]
+        current_token_price: uint256 = self.tokenToPrice[_ticker]
+        new_strike_price: uint256 = self.rebalanceStrikePrice(current_token_price,
+                                                              current_option.startTime,
+                                                              current_option.duration,
+                                                              current_option.optionType
+                                                              )
+        assert current_option.purchased == False, "This UNI option has been purchased already"
+        if current_option.owner == ZERO_ADDRESS:
+            assert current_option.riskTaker == msg.sender, "You are not the riskTaker of this UNI option"
+            balance_on_hold: uint256 = self.sellerLedger[_ticker][_optionId]
+
+            if current_token_price > current_option.marketPrice:
+                assert msg.value >= ((current_token_price * 100) - balance_on_hold), "You aren't sending enough to cover for the price increase of token"
+                
+            elif current_token_price < current_option.marketPrice:
+                send(msg.sender, (balance_on_hold - (current_token_price * 100)))
+
+            self.sellerLedger[_ticker][_optionId] = current_token_price * 100
+            self.uniOptions[_optionId].strikePrice = new_strike_price
+            self.uniOptions[_optionId].marketPrice = current_token_price
+        
+        elif current_option.riskTaker == ZERO_ADDRESS:
+            assert current_option.owner == msg.sender, "You are not the owner of this UNI option"
+            balance_on_hold: uint256 = self.buyerLedger[_ticker][_optionId]
+
+            if new_strike_price > current_option.strikePrice:
+                assert msg.value >= ((new_strike_price * 100) - balance_on_hold), "You aren't sending enough to cover for the price increase of token"
+            elif new_strike_price < current_option.strikePrice:
+                send(msg.sender, (balance_on_hold - (new_strike_price * 100)))
+
+            self.buyerLedger[_ticker][_optionId] = new_strike_price * 100
+            self.uniOptions[_optionId].strikePrice = new_strike_price
+            self.uniOptions[_optionId].marketPrice = current_token_price
+
+    else:
+        current_option: Option = self.compoundOptions[_optionId]
+        current_token_price: uint256 = self.tokenToPrice[_ticker]
+        new_strike_price: uint256 = self.rebalanceStrikePrice(current_token_price,
+                                                              current_option.startTime,
+                                                              current_option.duration,
+                                                              current_option.optionType
+                                                              )
+        assert current_option.purchased == False, "This COMP option has been purchased already"
+        if current_option.owner == ZERO_ADDRESS:
+            assert current_option.riskTaker == msg.sender, "You are not the riskTaker of this COMP option"
+            balance_on_hold: uint256 = self.sellerLedger[_ticker][_optionId]
+
+            if current_token_price > current_option.marketPrice:
+                assert msg.value >= ((current_token_price * 100) - balance_on_hold), "You aren't sending enough to cover for the price increase of token"
+                
+            elif current_token_price < current_option.marketPrice:
+                send(msg.sender, (balance_on_hold - (current_token_price * 100)))
+
+            self.sellerLedger[_ticker][_optionId] = current_token_price * 100
+            self.compoundOptions[_optionId].strikePrice = new_strike_price
+            self.compoundOptions[_optionId].marketPrice = current_token_price
+        
+        elif current_option.riskTaker == ZERO_ADDRESS:
+            assert current_option.owner == msg.sender, "You are not the owner of this COMP option"
+            balance_on_hold: uint256 = self.buyerLedger[_ticker][_optionId]
+
+            if new_strike_price > current_option.strikePrice:
+                assert msg.value >= ((new_strike_price * 100) - balance_on_hold), "You aren't sending enough to cover for the price increase of token"
+            elif new_strike_price < current_option.strikePrice:
+                send(msg.sender, (balance_on_hold - (new_strike_price * 100)))
+
+            self.buyerLedger[_ticker][_optionId] = new_strike_price * 100
+            self.compoundOptions[_optionId].strikePrice = new_strike_price
+            self.compoundOptions[_optionId].marketPrice = current_token_price
             
+
+@external
+@view
+def viewOptions(_ticker: String[4]):
+    assert 1 == 1
