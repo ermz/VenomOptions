@@ -473,4 +473,9 @@ def rebalanceOption(_ticker:String[4], _optionId:uint256):
 @external
 @view
 def viewOptions(_ticker: String[4]):
-    assert 1 == 1
+    if _ticker == "CRV":
+        for i in range(1_000):
+            if self.curveOptions[i] == empty(Option):
+                break
+            
+            console.log(self.curveOptions[i].marketPrice)
